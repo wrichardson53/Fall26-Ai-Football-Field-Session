@@ -957,6 +957,34 @@ def create_video_dock(parent):
     parent.play_button.clicked.connect(lambda: toggle_custom_video_playback(parent))
     controls_layout.addWidget(parent.play_button)
 
+    # Jump-to-snap button (enabled once a snap has been detected for the clip)
+    parent.snap_button = QPushButton("Snap")
+    parent.snap_button.setFixedSize(56, 30)
+    parent.snap_button.setToolTip("Pause and jump to the detected snap frame")
+    parent.snap_button.setEnabled(False)
+    parent.snap_button.setStyleSheet("""
+        QPushButton {
+            background-color: #404040;
+            border: 1px solid #555555;
+            color: white;
+            padding: 6px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #505050;
+        }
+        QPushButton:pressed {
+            background-color: #606060;
+        }
+        QPushButton:disabled {
+            color: #777777;
+        }
+    """)
+    parent.snap_button.clicked.connect(lambda: jump_to_snap(parent))
+    controls_layout.addWidget(parent.snap_button)
+
     # Time label
     parent.time_label = QLabel("00:00 / 00:00")
     parent.time_label.setFixedWidth(100)
@@ -1067,6 +1095,24 @@ def seek_custom_video(parent, position):
         total_time = total_frames / fps
         parent.time_label.setText(f"{int(current_time//60):02d}:{int(current_time%60):02d} / {int(total_time//60):02d}:{int(total_time%60):02d}")
 
+def jump_to_snap(parent):
+    """Pause the custom video and move it to the detected snap frame."""
+    custom_video = getattr(parent, 'custom_video', None)
+    slider = getattr(parent, 'progress_slider', None)
+    if custom_video is None or slider is None or not slider.snap_frames or not custom_video.total_frames:
+        print("No snap detected for this video")
+        return False
+
+    if custom_video.is_playing:
+        custom_video.toggle_playback()
+        parent.play_button.setText("▶")
+
+    custom_video.current_frame = max(0, min(int(slider.snap_frames[0]), custom_video.total_frames - 1))
+    custom_video.update_parent_controls()
+    custom_video.update_virtual_field()
+    custom_video.update()
+    return True
+
 def pause_custom_video_for_drag(parent):
     """Pause custom video when dragging slider"""
     if hasattr(parent, 'custom_video'):
@@ -1138,6 +1184,8 @@ def load_snap_detection_data(parent, video_path):
         else:
             # Clear snap markers if file doesn't exist
             parent.progress_slider.set_snap_frames([], 0)
+        if hasattr(parent, 'snap_button'):
+            parent.snap_button.setEnabled(bool(parent.progress_slider.snap_frames))
     except Exception as e:
         print(f"Error loading snap detection data: {e}")
 

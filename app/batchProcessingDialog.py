@@ -799,7 +799,7 @@ class BatchProcessingDialog(QDialog):
         self.skip_processed_checkbox = QCheckBox("Skip processed videos")
         self.skip_processed_checkbox.setStyleSheet("""
             QCheckBox {
-                color: #000000;
+                color: palette(window-text);
                 font-size: 11px;
                 spacing: 5px;
             }

@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QSlider
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap, QPainter, QPen, QBrush, QColor
+from PySide6.QtGui import QPixmap, QPainter, QPen, QBrush, QColor, QPalette
 import subprocess
 import platform
 import cv2
@@ -301,7 +301,7 @@ class VirtualFieldWidget(QWidget):
 
         
         # Draw frame number
-        painter.setPen(QPen(QColor(0, 0, 0)))  # Black text
+        painter.setPen(QPen(self.palette().color(QPalette.WindowText)))  # Follows light/dark theme
         painter.drawText(10, 20, f"Frame: {self.current_frame}")
         
         painter.end()

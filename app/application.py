@@ -61,9 +61,6 @@ class MainWindow(QMainWindow):
         close_action.triggered.connect(self.close)
         file_menu.addAction(close_action)
 
-        # Window Menu
-        window_menu = menu_bar.addMenu("Window")
-
         # --- Dock Widgets ---
         self.video_dock = create_video_dock(self)
         self.file_dock = create_file_dock(self)
@@ -83,13 +80,6 @@ class MainWindow(QMainWindow):
         # Set equal sizes for all dock widgets
         self.set_equal_dock_sizes()
 
-        # Add dock visibility toggles to Window menu
-        window_menu.addAction(self.video_dock.toggleViewAction())
-        window_menu.addAction(self.file_dock.toggleViewAction())
-        window_menu.addAction(self.data_dock.toggleViewAction())
-        window_menu.addAction(self.virtual_dock.toggleViewAction())
-        
-        
         # Load settings and default folder after docks are created
         self.load_settings()
 
@@ -143,23 +133,24 @@ class MainWindow(QMainWindow):
     
     def apply_palette(self, palette, dark_mode):
         """Apply palette and sync menu bar colors."""
-        QApplication.instance().setPalette(palette)
+        app = QApplication.instance()
+        set_color_scheme(app, dark_mode)
+        app.setPalette(palette)
         self.set_menu_colors(dark_mode)
 
     def apply_system_palette(self):
         """Follow OS theme and sync menu bar colors."""
-        is_dark = darkdetect.isDark()
+        is_dark = bool(darkdetect.isDark())
         palette = get_dark_palette() if is_dark else get_light_palette()
         self.apply_palette(palette, is_dark)
 
     def set_menu_colors(self, dark_mode):
         """Ensure menu bar titles contrast with current theme."""
-        text_color = "white" if dark_mode else "black"
+        # Menus take their text color from the palette; only the hover color differs per theme
+        hover = "#505050" if dark_mode else "#dcdcdc"
         self.menuBar().setStyleSheet(
-            f"QMenuBar {{ color: {text_color}; }}\n"
-            f"QMenuBar::item {{ color: {text_color}; }}\n"
-            "QMenu { color: black; }\n"
-            "QMenu::item:selected { background-color: #dcdcdc; }\n"
+            "QMenuBar, QMenuBar::item, QMenu { color: palette(window-text); }\n"
+            f"QMenuBar::item:selected, QMenu::item:selected {{ background-color: {hover}; }}\n"
         )
 
     def load_settings(self):
@@ -210,13 +201,16 @@ class MainWindow(QMainWindow):
                 print(f"Error loading default folder: {e}")
 
 
+def set_color_scheme(app, dark_mode):
+    """Tell Qt which scheme we use so it doesn't follow the OS setting instead."""
+    app.styleHints().setColorScheme(Qt.ColorScheme.Dark if dark_mode else Qt.ColorScheme.Light)
+
+
 def apply_system_theme(app):
-    if darkdetect.isDark():
-        app.setPalette(get_dark_palette())
-        return True
-    else:
-        app.setPalette(get_light_palette())
-        return False
+    is_dark = bool(darkdetect.isDark())
+    set_color_scheme(app, is_dark)
+    app.setPalette(get_dark_palette() if is_dark else get_light_palette())
+    return is_dark
 
 
 if __name__ == "__main__":
@@ -256,8 +250,10 @@ if __name__ == "__main__":
     
     app = QApplication(sys.argv)
     
-    # Remove Fusion style to allow native dialogs
-    #app.setStyle(QStyleFactory.create("windows11"))
+    # Fusion draws everything from our palette, so Light/Dark look right whatever the OS
+    # theme is (the default windows11 style follows the OS and ignores parts of the palette).
+    # File dialogs stay native either way.
+    app.setStyle(QStyleFactory.create("Fusion"))
     
     system_dark = apply_system_theme(app)
     window = MainWindow(system_dark)

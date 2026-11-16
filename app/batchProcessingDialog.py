@@ -22,6 +22,10 @@ import glob
 import threading
 import multiprocessing
 
+# Player detection only needs every Nth frame to find the snap; the snap frame
+# itself is then detected in full. Everything after snap detection is snap-only.
+PLAYER_DETECTION_STRIDE = 3
+
 # Set up logging for batch processing
 def setup_batch_logging():
     """Set up logging for batch processing operations"""
@@ -54,6 +58,10 @@ def setup_batch_logging():
 # Initialize logger
 _batch_logger, _batch_log_file = setup_batch_logging()
 
+# Must match NOT_ENOUGH_MARKERS_EXIT in scripts/autoCorrespondancePoints.py
+NOT_ENOUGH_MARKERS_EXIT = 2
+
+
 def get_project_root():
     """Return project root, handling PyInstaller one-file extractions."""
     # Import here to avoid circular imports
@@ -77,36 +85,13 @@ def get_resource_path(*parts):
 
 
 def get_python_executable():
-    """Get the correct Python executable for the current platform
-    
-    When running as a PyInstaller executable, returns sys.executable.
-    When running in development, returns the system Python executable.
+    """Get the correct Python executable to run helper scripts with.
+
+    Always returns sys.executable so child scripts run under the same
+    interpreter (and virtualenv) as the app itself, rather than whatever
+    'python' happens to resolve to first on PATH.
     """
-    # If running as PyInstaller bundle, use sys.executable
-    if hasattr(sys, "_MEIPASS") or getattr(sys, 'frozen', False):
-        return sys.executable
-    
-    # Running in development mode - use system Python
-    if sys.platform.startswith('win'):
-        # On Windows, try 'python' first, then 'python3'
-        for cmd in ['python', 'python3']:
-            try:
-                result = subprocess.run([cmd, '--version'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    return cmd
-            except FileNotFoundError:
-                continue
-        return 'python'  # Fallback
-    else:
-        # On Unix-like systems, try 'python3' first, then 'python'
-        for cmd in ['python3', 'python']:
-            try:
-                result = subprocess.run([cmd, '--version'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    return cmd
-            except FileNotFoundError:
-                continue
-        return 'python3'  # Fallback
+    return sys.executable
 
 def build_script_command(script_path, *args):
     """Build a command to run a Python script, handling PyInstaller bundles correctly.
@@ -247,7 +232,8 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
         cmd_result = build_script_command(
             get_resource_path("scripts", "playerDetection.py"),
             "--video", video_path,
-            "--output", detection_output
+            "--output", detection_output,
+            "--stride", str(PLAYER_DETECTION_STRIDE)
         )
         if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
             player_cmd, player_env, _ = cmd_result
@@ -266,6 +252,19 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
             snap_cmd = cmd_result
             snap_env = None
         
+        # Full player detection on the snap frame (the first pass only sampled every Nth frame)
+        cmd_result = build_script_command(
+            get_resource_path("scripts", "playerDetection.py"),
+            "--video", video_path,
+            "--output", detection_output,
+            "--snap-detection", snap_output
+        )
+        if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
+            snap_player_cmd, snap_player_env, _ = cmd_result
+        else:
+            snap_player_cmd = cmd_result
+            snap_player_env = None
+
         # Position detection now uses snap detection, so build command with snap detection path
         position_cmd_args = [
             get_resource_path("scripts", "positionDetection.py"),
@@ -283,7 +282,8 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
         cmd_result = build_script_command(
             get_resource_path("scripts", "yardMarkerDetection.py"),
             "--video", video_path,
-            "--output", yard_marker_output
+            "--output", yard_marker_output,
+            "--snap-detection", snap_output
         )
         if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
             yard_marker_cmd, yard_marker_env, _ = cmd_result
@@ -303,6 +303,12 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
                 "env": snap_env
             },
             {
+                "name": "Snap Frame Player Detection",
+                "cmd": snap_player_cmd,
+                "env": snap_player_env,
+                "prereq": [snap_output]
+            },
+            {
                 "name": "Position Detection",
                 "cmd": position_cmd,
                 "env": position_env,
@@ -311,7 +317,8 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
             {
                 "name": "Yard Marker Detection",
                 "cmd": yard_marker_cmd,
-                "env": yard_marker_env
+                "env": yard_marker_env,
+                "prereq": [snap_output]
             },
             {
                 "name": "Correspondence Points Generation",
@@ -339,10 +346,10 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
             "--per-frame"
         )
         if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
-            steps[4]["cmd"], steps[4]["env"], _ = cmd_result
+            steps[5]["cmd"], steps[5]["env"], _ = cmd_result
         else:
-            steps[4]["cmd"] = cmd_result
-            steps[4]["env"] = None
+            steps[5]["cmd"] = cmd_result
+            steps[5]["env"] = None
         
         cmd_result = build_script_command(
             get_resource_path("scripts", "perFrameHomographyTransform.py"),
@@ -351,10 +358,10 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
             "--output", homography_output
         )
         if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
-            steps[5]["cmd"], steps[5]["env"], _ = cmd_result
+            steps[6]["cmd"], steps[6]["env"], _ = cmd_result
         else:
-            steps[5]["cmd"] = cmd_result
-            steps[5]["env"] = None
+            steps[6]["cmd"] = cmd_result
+            steps[6]["env"] = None
         
         cmd_result = build_script_command(
             get_resource_path("scripts", "staticProcess.py"),
@@ -363,10 +370,10 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
             "--cache-dir", output_dir
         )
         if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
-            steps[6]["cmd"], steps[6]["env"], _ = cmd_result
+            steps[7]["cmd"], steps[7]["env"], _ = cmd_result
         else:
-            steps[6]["cmd"] = cmd_result
-            steps[6]["env"] = None
+            steps[7]["cmd"] = cmd_result
+            steps[7]["env"] = None
         
         emit_output(f"Starting processing for {video_name}")
         _batch_logger.debug(f"Processing {video_name}: Output directory: {output_dir}, Video folder: {video_folder}")
@@ -399,7 +406,13 @@ def process_single_video(video_path, video_folder, output_dir="cache", output_ca
                 env=step.get("env")
             )
             
-            if not success:
+            if success == NOT_ENOUGH_MARKERS_EXIT and step_name == "Correspondence Points Generation":
+                _batch_logger.warning(f"Processing {video_name}: not enough yard markers, skipping field-coordinate steps")
+                emit_output(f"Not enough yard markers visible for {video_name}; skipping Homography and Static Process "
+                            f"(positions use the pixel-based fallback)")
+                return True
+
+            if success is not True:
                 _batch_logger.error(f"Processing {video_name}: Step '{step_name}' failed")
                 emit_output(f"{step_name} failed for {video_name}")
                 return False
@@ -482,6 +495,8 @@ def _run_command_standalone(cmd, step_name, output_callback=None, cancel_check=N
         
         _batch_logger.warning(f"Command for '{step_name}' failed with return code {return_code}")
         emit_output(f"{step_name} failed with return code {return_code}")
+        if return_code == NOT_ENOUGH_MARKERS_EXIT:
+            return return_code
         return False
     
     except ProcessingCancelled:

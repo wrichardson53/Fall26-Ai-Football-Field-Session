@@ -9,16 +9,18 @@ The `scripts/` folder collects the command-line utilities that generate model ou
 
 ## Script Catalog
 
-The UI processing pipeline runs these scripts in order (steps 1–7):
+The UI processing pipeline runs these scripts in order (steps 1–7). Only the snap frame is analyzed, so player detection first samples every 3rd frame (enough to find the snap), and every step after snap detection runs on the snap frame alone.
 
-- `playerDetection.py` *(Step 1)*
-  Runs an Ultralytics YOLO model (`yolo_models/bestPlayerDetectorM.pt`) over a video and produces frame-by-frame player bounding boxes. Saves JSON with `frames[]` entries that the UI overlays in `video.py`.
+- `playerDetection.py` *(Step 1, and again after Step 2)*
+  Runs an Ultralytics YOLO model (`yolo_models/bestPlayerDetectorM.pt`) over a video and produces player bounding boxes. `--stride 3` detects every 3rd frame (the coarse pass snap detection needs). Re-run with `--snap-detection` after Step 2 to detect the snap frame in full and merge it into the same JSON. The UI overlays these boxes in `video.py`.
   ```bash
-  python scripts/playerDetection.py --video path/to/game.mp4 --output cache/session/players/game_detection.json
+  python scripts/playerDetection.py --video path/to/game.mp4 --output cache/session/players/game_detection.json --stride 3
+  # after snap detection:
+  python scripts/playerDetection.py --video path/to/game.mp4 --output cache/session/players/game_detection.json --snap-detection cache/session/snap_detection/game_snap_detection.json
   ```
 
 - `snapDetection.py` *(Step 2)*
-  Analyzes the player detection JSON to find the snap frame for each clip. Writes a snap-detection JSON with one or more `snaps[]` entries (frame number + timestamp) used by later steps (position detection, static process) and by the UI timeline markers.
+  Analyzes the player detection JSON to find the snap frame for each clip (handles strided detections automatically). Writes a snap-detection JSON with one or more `snaps[]` entries (frame number + timestamp) used by later steps (position detection, static process) and by the UI timeline markers.
   ```bash
   python scripts/snapDetection.py --player-detections cache/session/players/game_detection.json --output cache/session/snap_detection/game_snap_detection.json
   ```
@@ -30,9 +32,9 @@ The UI processing pipeline runs these scripts in order (steps 1–7):
   ```
 
 - `yardMarkerDetection.py` *(Step 4)*
-  Detects sideline yard markers using `yolo_models/yardMarkerDetection.pt`. Outputs a JSON payload mirroring the player format but focused on marker classes like `fl1`, `nr3`, etc. These detections drive correspondence estimation and field calibration.
+  Detects sideline yard markers using `yolo_models/yardMarkerDetection.pt`. Outputs a JSON payload mirroring the player format but focused on marker classes like `fl1`, `nr3`, etc. These detections drive correspondence estimation and field calibration. With `--snap-detection` only the snap frame is processed (omit it to process every frame).
   ```bash
-  python scripts/yardMarkerDetection.py --video path/to/game.mp4 --output cache/session/yard_markers/game_yard_markers.json
+  python scripts/yardMarkerDetection.py --video path/to/game.mp4 --output cache/session/yard_markers/game_yard_markers.json --snap-detection cache/session/snap_detection/game_snap_detection.json
   ```
 
 - `autoCorrespondancePoints.py` *(Step 5)*
@@ -82,7 +84,7 @@ The UI processing pipeline runs these scripts in order (steps 1–7):
   Empty initializer; keeps the folder importable so dialogs can run scripts as modules.
 
 ## Typical Processing Flow (manual)
-1. `playerDetection.py` → `snapDetection.py` → `positionDetection.py` (player + snap + position data)
+1. `playerDetection.py --stride 3` → `snapDetection.py` → `playerDetection.py --snap-detection` → `positionDetection.py` (player + snap + position data)
 2. `yardMarkerDetection.py` → `autoCorrespondancePoints.py` → `perFrameHomographyTransform.py` (field calibration + projection)
 3. `staticProcess.py` (final metadata + form prediction in the data sheet CSV)
 4. Optionally visualize the result with `renderFieldVideo.py`.

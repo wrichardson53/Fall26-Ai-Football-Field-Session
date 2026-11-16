@@ -68,7 +68,7 @@ def match_players(prev_centers, curr_centers):
 # Velocity Computation
 # ------------------------------------------------------------------
 
-def compute_velocity(detections, min_players_per_frame=15):
+def compute_velocity(detections, min_players_per_frame=15, frame_stride=1):
     """
     Returns:
         velocities       – per-frame scalar (camera-corrected, outlier-filtered)
@@ -80,6 +80,9 @@ def compute_velocity(detections, min_players_per_frame=15):
     Frames with fewer than *min_players_per_frame* detections are treated as
     unreliable: velocity and mover count are set to 0 and prev_centers is reset
     so adjacent sparse frames cannot contaminate the velocity signal.
+
+    *frame_stride* is the gap between detected frames (playerDetection --stride);
+    the per-step "is moving" threshold scales with it.
     """
     fps = detections.get("video_info", {}).get("fps", 30.0)
     frames = detections.get("frames", [])
@@ -88,7 +91,7 @@ def compute_velocity(detections, min_players_per_frame=15):
     mover_counts = []
     player_counts = []
     prev_centers = None
-    small_move_threshold = 1.5   # pixels; below this = "not really moving"
+    small_move_threshold = 1.5 * frame_stride   # pixels per step; below this = "not really moving"
 
     for frame in frames:
         centers = []
@@ -441,8 +444,20 @@ def main():
     print(f"[INFO] Loading detections from: {args.player_detections}")
     raw = load_player_detections(args.player_detections)
 
+    # Player detection may have sampled every Nth frame (--stride); work in sample
+    # space at the effective fps, then map results back to real frame numbers.
+    frame_numbers = [f.get("frame_number", i) for i, f in enumerate(raw.get("frames", []))]
+    stride = int(np.median(np.diff(frame_numbers))) if len(frame_numbers) > 1 else 1
+    stride = max(1, stride)
+    first_frame = frame_numbers[0] if frame_numbers else 0
+
     print("[INFO] Computing camera-corrected velocities...")
-    velocities, mover_counts, player_counts, fps = compute_velocity(raw, min_players_per_frame=args.min_players)
+    velocities, mover_counts, player_counts, fps = compute_velocity(
+        raw, min_players_per_frame=args.min_players, frame_stride=stride)
+    real_fps = fps
+    fps = fps / stride
+    if stride > 1:
+        print(f"[INFO] Detections sampled every {stride} frames (effective {fps:.1f} fps).")
 
     if len(velocities) == 0:
         print("[ERROR] No velocity data computed.")
@@ -466,6 +481,10 @@ def main():
         min_players_per_frame=args.min_players,
         top_k=args.top_k,
     )
+
+    for s in snaps:
+        s["frame"] = int(first_frame + s["frame"] * stride)
+        s["time"] = round(s["frame"] / real_fps, 3)
 
     print(f"[SUCCESS] Found {len(snaps)} snap(s):")
     for i, s in enumerate(snaps, 1):

@@ -27,6 +27,10 @@ except ImportError:
         'player': QColor(0, 255, 0)
     }
 
+# Max pixel distance between a homography point's box and a video box to treat
+# them as the same player (they share player-detector boxes, so normally ~0).
+LABEL_MATCH_PX = 20
+
 # Add scripts directory to path to import field drawing functions
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 
@@ -273,11 +277,16 @@ class VirtualFieldWidget(QWidget):
                                 ocx = orig_bbox.get('center_x')
                                 ocy = orig_bbox.get('center_y')
                                 if ocx is not None and ocy is not None:
-                                    best_cls, _ = min(
+                                    best_cls, best_d = min(
                                         ((cls, (ocx - px) ** 2 + (ocy - py) ** 2)
                                          for px, py, cls in label_pts),
                                         key=lambda t: t[1]
                                     )
+                                    # The video boxes are these same player-detector
+                                    # boxes; no box here means the video dropped this
+                                    # detection (duplicate/fragment), so skip it too.
+                                    if best_d > LABEL_MATCH_PX ** 2:
+                                        continue
                                     resolved_label = best_cls
                             if resolved_label == 'defense':
                                 dot_color = POSITION_COLORS['defense']
@@ -285,7 +294,9 @@ class VirtualFieldWidget(QWidget):
                                 dot_color = POSITION_COLORS['qb']
                             elif resolved_label == 'running_back':
                                 dot_color = POSITION_COLORS['running_back']
-                            elif resolved_label in ('wide_receiver', 'tight_end'):
+                            elif resolved_label == 'tight_end':
+                                dot_color = POSITION_COLORS['tight_end']
+                            elif resolved_label == 'wide_receiver':
                                 dot_color = POSITION_COLORS['wide_receiver']
                             else:
                                 dot_color = POSITION_COLORS['oline']

@@ -15,6 +15,20 @@ import cv2
 FIELD_LENGTH_YD = 120.0  # 120 yards (0-120)
 FIELD_WIDTH_YD = 160.0 / 3.0  # ~53.33 yards (0-53.33)
 
+# A homography that puts more than this share of players off the field is
+# degenerate (e.g. nearly collinear markers); its output would be garbage.
+OFF_FIELD_MARGIN_YD = 10.0
+MAX_OFF_FIELD_FRACTION = 0.2
+
+def _mostly_on_field(positions):
+    """True if the projected players are (almost all) on the field."""
+    if not positions:
+        return True
+    off = sum(1 for p in positions
+              if not (-OFF_FIELD_MARGIN_YD <= p["normalized_position"]["x"] <= FIELD_LENGTH_YD + OFF_FIELD_MARGIN_YD
+                      and -OFF_FIELD_MARGIN_YD <= p["normalized_position"]["y"] <= FIELD_WIDTH_YD + OFF_FIELD_MARGIN_YD))
+    return off <= MAX_OFF_FIELD_FRACTION * len(positions)
+
 def load_json_data(file_path):
     """Load JSON data from a file."""
     with open(file_path, 'r') as f:
@@ -149,6 +163,11 @@ def process_per_frame_homography(position_detections_path, correspondence_points
                         "confidence": position_det.get('confidence', 0.0)
                     })
         
+        if not _mostly_on_field(transformed_positions):
+            frames_with_sufficient_markers -= 1
+            print(f"Frame {frame_number}: Discarding homography (players projected off the field)")
+            transformed_positions = []
+
         normalized_positions_output['normalized_positions'][str(frame_number)] = transformed_positions
         
         if i % 50 == 0:

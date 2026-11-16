@@ -238,6 +238,42 @@ def parse_yard_marker_label(label):
     }
 
 
+# Lowest confidence a marker may have when it is pulled in to balance the sides
+FALLBACK_CONFIDENCE = 0.5
+MIN_POINTS_PER_SIDE = 2
+# Exit code when the clip simply has too few visible yard markers (vs. a crash),
+# so the app can finish processing without field coordinates.
+NOT_ENOUGH_MARKERS_EXIT = 2
+
+
+def _select_frame_markers(frame_detections, confidence_threshold):
+    """Best detection per marker class, with both sidelines represented.
+
+    Markers along one sideline all share the same field y, so a set dominated by
+    one side is (nearly) collinear and gives a garbage homography. When a side has
+    fewer than MIN_POINTS_PER_SIDE confident markers, top it up with that side's
+    lower-confidence markers (down to FALLBACK_CONFIDENCE).
+    """
+    def best_per_class(detections):
+        best = {}
+        for det in detections:
+            cls = det.get('class')
+            if cls not in best or det.get('confidence', 0) > best[cls].get('confidence', 0):
+                best[cls] = det
+        return best
+
+    selected = best_per_class(filter_detections_by_confidence(frame_detections, confidence_threshold))
+    fallback = best_per_class(filter_detections_by_confidence(frame_detections, FALLBACK_CONFIDENCE))
+
+    for side in ('n', 'f'):
+        have = sum(1 for cls in selected if cls.startswith(side))
+        extras = sorted((det for cls, det in fallback.items() if cls.startswith(side) and cls not in selected),
+                        key=lambda d: d.get('confidence', 0), reverse=True)
+        for det in extras[:max(0, MIN_POINTS_PER_SIDE - have)]:
+            selected[det['class']] = det
+    return list(selected.values())
+
+
 def process_yard_marker_detections_per_frame(detection_json_path, confidence_threshold=0.7):
     """
     Process yard marker detection JSON to create correspondence points for each frame
@@ -262,34 +298,19 @@ def process_yard_marker_detections_per_frame(detection_json_path, confidence_thr
     # Process each frame individually
     frame_correspondences = {}
     frames_with_points = 0
-    last_valid_correspondence_points = []  # Track last valid frame data
     
     for i, frame_data in enumerate(frames):
         frame_number = frame_data.get('frame_number', 0)
         frame_detections = frame_data.get('detections', [])
         
-        # Filter detections by confidence for this frame
-        filtered_detections = filter_detections_by_confidence(frame_detections, confidence_threshold)
+        # Best detection per marker class, topped up so both sidelines are represented
+        best_detections = _select_frame_markers(frame_detections, confidence_threshold)
         
-        if len(filtered_detections) < 4:
-            # Not enough detections for this frame - use last valid frame data
-            if last_valid_correspondence_points:
-                frame_correspondences[frame_number] = last_valid_correspondence_points.copy()
-                print(f"Frame {frame_number}: Insufficient points ({len(filtered_detections)}), using last valid frame data")
-            else:
-                frame_correspondences[frame_number] = []
-                print(f"Frame {frame_number}: Insufficient points ({len(filtered_detections)}) and no previous valid data")
+        if len(best_detections) < 4:
+            # Not enough detections for this frame - filled from the nearest valid frame below
+            frame_correspondences[frame_number] = []
+            print(f"Frame {frame_number}: Insufficient points ({len(best_detections)})")
             continue
-        
-        # Group detections by marker class for this frame
-        grouped_detections = group_detections_by_marker(filtered_detections)
-        
-        # For each marker class, use the best detection (highest confidence) instead of averaging
-        best_detections = []
-        for marker_class, detections in grouped_detections.items():
-            # Find the detection with highest confidence
-            best_detection = max(detections, key=lambda x: x.get('confidence', 0))
-            best_detections.append(best_detection)
         
         # Convert to correspondence points for this frame
         correspondence_points = []
@@ -317,9 +338,7 @@ def process_yard_marker_detections_per_frame(detection_json_path, confidence_thr
         
         frame_correspondences[frame_number] = correspondence_points
         
-        # Update last valid correspondence points if this frame has sufficient points
         if len(correspondence_points) >= 4:
-            last_valid_correspondence_points = correspondence_points.copy()
             frames_with_points += 1
         
         # Progress update every 50 frames
@@ -327,6 +346,16 @@ def process_yard_marker_detections_per_frame(detection_json_path, confidence_thr
             progress = (i + 1) / len(frames) * 100
             print(f"Progress: {progress:.1f}% - Processed {i+1}/{len(frames)} frames ({frames_with_points} with sufficient points)")
     
+    # Frames short of 4 points borrow from the nearest frame (either side) that has
+    # enough; the camera barely moves between nearby frames while the offense is set.
+    valid_frames = [f for f, pts in frame_correspondences.items() if len(pts) >= 4]
+    if valid_frames:
+        for frame_number, pts in frame_correspondences.items():
+            if len(pts) < 4:
+                nearest = min(valid_frames, key=lambda f: abs(f - frame_number))
+                frame_correspondences[frame_number] = [dict(p) for p in frame_correspondences[nearest]]
+                print(f"Frame {frame_number}: using correspondence points from frame {nearest}")
+
     print(f"Created per-frame correspondence points: {frames_with_points}/{len(frames)} frames have sufficient points")
     
     return frame_correspondences
@@ -488,7 +517,7 @@ def main():
             
             if frames_with_points == 0:
                 print(f"No frames with sufficient correspondence points found (need at least {args.min_points} points per frame)")
-                return 1
+                return NOT_ENOUGH_MARKERS_EXIT
             
             # Save per-frame points
             save_correspondence_points_per_frame(frame_correspondences, args.output)

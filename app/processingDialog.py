@@ -19,6 +19,14 @@ import time
 from pathlib import Path
 import pandas as pd
 
+# Player detection only needs every Nth frame to find the snap; the snap frame
+# itself is then detected in full. Everything after snap detection is snap-only.
+PLAYER_DETECTION_STRIDE = 3
+
+# Must match NOT_ENOUGH_MARKERS_EXIT in scripts/autoCorrespondancePoints.py
+NOT_ENOUGH_MARKERS_EXIT = 2
+
+
 def get_project_root():
     """Return the project root, accounting for PyInstaller one-file extraction."""
     # Import here to avoid circular imports
@@ -42,36 +50,13 @@ def get_resource_path(*relative_parts):
 
 
 def get_python_executable():
-    """Get the correct Python executable for the current platform
-    
-    When running as a PyInstaller executable, returns sys.executable.
-    When running in development, returns the system Python executable.
+    """Get the correct Python executable to run helper scripts with.
+
+    Always returns sys.executable so child scripts run under the same
+    interpreter (and virtualenv) as the app itself, rather than whatever
+    'python' happens to resolve to first on PATH.
     """
-    # If running as PyInstaller bundle, use sys.executable
-    if hasattr(sys, "_MEIPASS") or getattr(sys, 'frozen', False):
-        return sys.executable
-    
-    # Running in development mode - use system Python
-    if sys.platform.startswith('win'):
-        # On Windows, try 'python' first, then 'python3'
-        for cmd in ['python', 'python3']:
-            try:
-                result = subprocess.run([cmd, '--version'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    return cmd
-            except FileNotFoundError:
-                continue
-        return 'python'  # Fallback
-    else:
-        # On Unix-like systems, try 'python3' first, then 'python'
-        for cmd in ['python3', 'python']:
-            try:
-                result = subprocess.run([cmd, '--version'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    return cmd
-            except FileNotFoundError:
-                continue
-        return 'python3'  # Fallback
+    return sys.executable
 
 def build_script_command(script_path, *args):
     """Build a command to run a Python script, handling PyInstaller bundles correctly.
@@ -109,6 +94,7 @@ class ProcessingWorker(QThread):
     progress_updated = Signal(int, str)  # progress percentage, status message
     output_received = Signal(str)  # terminal output
     step_completed = Signal(str, bool)  # step name, success status
+    finished_without_field = Signal(str)  # reason the field-coordinate steps were skipped
     processing_completed = Signal(dict)  # results
     processing_failed = Signal(str)  # error message
     show_skip_dialog = Signal(str, int)  # step name, step index
@@ -345,7 +331,8 @@ class ProcessingWorker(QThread):
                 cmd_result = build_script_command(
                     get_resource_path("scripts", "playerDetection.py"),
                     "--video", self.video_path,
-                    "--output", self.detection_output
+                    "--output", self.detection_output,
+                    "--stride", str(PLAYER_DETECTION_STRIDE)
                 )
                 if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
                     detection_cmd, cmd_env, _ = cmd_result
@@ -399,7 +386,22 @@ class ProcessingWorker(QThread):
                 if self.is_cancelled:
                     return
                     
-                result = self._run_command(snap_cmd, "Snap Detection", 0, 100, env=cmd_env)
+                result = self._run_command(snap_cmd, "Snap Detection", 0, 50, env=cmd_env)
+                if result and not self.is_cancelled:
+                    # Step 1 only sampled every Nth frame; detect the snap frame in full.
+                    self.output_received.emit("Step 2: Detecting players on the snap frame...")
+                    cmd_result = build_script_command(
+                        get_resource_path("scripts", "playerDetection.py"),
+                        "--video", self.video_path,
+                        "--output", self.detection_output,
+                        "--snap-detection", self.snap_output
+                    )
+                    if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
+                        snap_player_cmd, cmd_env, _ = cmd_result
+                    else:
+                        snap_player_cmd = cmd_result
+                        cmd_env = None
+                    result = self._run_command(snap_player_cmd, "Snap Frame Player Detection", 50, 100, env=cmd_env)
                 if result:
                     self.step_completed.emit("Snap Detection", True)
                 else:
@@ -486,7 +488,8 @@ class ProcessingWorker(QThread):
                 cmd_result = build_script_command(
                     get_resource_path("scripts", "yardMarkerDetection.py"),
                     "--video", self.video_path,
-                    "--output", yard_marker_output
+                    "--output", yard_marker_output,
+                    "--snap-detection", self.snap_output
                 )
                 if isinstance(cmd_result, tuple) and len(cmd_result) == 3:
                     yard_marker_cmd, cmd_env, _ = cmd_result
@@ -554,6 +557,10 @@ class ProcessingWorker(QThread):
                     from virtualField import update_field_with_correspondence_points
                     update_field_with_correspondence_points(self.parent(), correspondence_output, frame_number=0)
                     self.step_completed.emit("Correspondence Points Generation", True)
+                elif getattr(self, "last_return_code", None) == NOT_ENOUGH_MARKERS_EXIT:
+                    self.finished_without_field.emit(
+                        "Not enough yard markers visible to map players onto the field. "
+                        "Skipping Homography and Static Process; positions use the pixel-based fallback.")
                 else:
                     self.step_completed.emit("Correspondence Points Generation", False)
                     
@@ -704,6 +711,7 @@ class ProcessingWorker(QThread):
             progress_end: Ending progress percentage
             env: Optional environment dictionary (for PyInstaller script execution)
         """
+        self.last_return_code = None
         if self.is_cancelled:
             return False
             
@@ -742,6 +750,7 @@ class ProcessingWorker(QThread):
             line_count = 0
             start_time = time.time()
             last_update_time = 0
+            progress = 0  # kept between updates; not every branch below recomputes it
             
             # Cross-platform non-blocking output reading using threading
             import threading
@@ -828,6 +837,7 @@ class ProcessingWorker(QThread):
             
             # Wait for process to complete
             return_code = self.process.wait()
+            self.last_return_code = return_code
             
             # Wait for output threads to finish and read any remaining output
             if self.output_thread and self.output_thread.is_alive():
@@ -1191,6 +1201,7 @@ class ProcessingDialog(QDialog):
         self.worker.progress_updated.connect(self.update_progress)
         self.worker.output_received.connect(self.add_output)
         self.worker.step_completed.connect(self.step_completed)
+        self.worker.finished_without_field.connect(self.finished_without_field)
         self.worker.processing_completed.connect(self.processing_completed)
         self.worker.processing_failed.connect(self.processing_failed)
         self.worker.show_skip_dialog.connect(self.show_skip_dialog)
@@ -1253,6 +1264,12 @@ class ProcessingDialog(QDialog):
             self.next_button.setEnabled(False)
             self.next_button.setText("Next Step")
     
+    def finished_without_field(self, reason):
+        """Correspondence found too few yard markers: finish without the field-coordinate steps."""
+        self.add_output(f"WARNING: {reason}")
+        self.processing_completed({"homography_output": "N/A (no field coordinates for this clip)"})
+        self.status_label.setText("Processing finished without field coordinates")
+
     def reload_snap_markers(self, parent_window):
         """Reload snap detection markers after snap detection completes"""
         try:

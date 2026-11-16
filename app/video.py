@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from fileAccess import get_cache_dir
+from positionRoles import assign_roles_by_field_geometry, label_unmatched_by_line
+from positionRoles import MATCH_PX as POSITION_LABEL_MATCH_PX
 
 # Define colors for specific position labels
 POSITION_COLORS = {
@@ -339,7 +341,9 @@ class CustomVideoWidget(QWidget):
                 box_color = POSITION_COLORS['qb']                  # yellow
             elif class_name == 'running_back':
                 box_color = POSITION_COLORS['running_back']        # orange
-            elif class_name in ('wide_receiver', 'tight_end'):
+            elif class_name == 'tight_end':
+                box_color = POSITION_COLORS['tight_end']           # magenta
+            elif class_name == 'wide_receiver':
                 box_color = POSITION_COLORS['wide_receiver']       # cyan
             else:
                 box_color = POSITION_COLORS['oline']               # blue for other offense
@@ -1534,7 +1538,10 @@ def _load_position_data_for_offense_mode(parent):
     if not os.path.exists(positions_file):
         print(f"[OFFENSE SELECTION] Positions file not found: {positions_file}")
         return
-    PLAYER_POS_MATCH_PX = 150  # max center distance to pair a player bbox with a position label
+    # Max center distance to pair a player bbox with a position label. Same value
+    # the WR SET calculation uses, so the overlay and the data sheet agree; a looser
+    # match lets defenders in the line pile borrow offensive labels.
+    PLAYER_POS_MATCH_PX = POSITION_LABEL_MATCH_PX
 
     try:
         with open(positions_file, 'r') as f:
@@ -1600,6 +1607,14 @@ def _load_position_data_for_offense_mode(parent):
                                 'confidence': best_pos.get('confidence', 1.0),
                                 'bbox': pl_bbox,
                             })
+                        else:
+                            # Position model missed this player; its team is
+                            # filled in from the line of scrimmage below.
+                            merged.append({
+                                'class': None,
+                                'confidence': pl.get('confidence', 1.0),
+                                'bbox': pl_bbox,
+                            })
 
                     if merged:
                         frame_data['detections'] = merged
@@ -1614,10 +1629,10 @@ def _load_position_data_for_offense_mode(parent):
         MAX_WR = 5
         for frame_data in data.get('frames', []):
             dets = frame_data.get('detections', [])
-            wr_dets = [d for d in dets if d.get('class', '').lower() in WR_CLASSES]
+            wr_dets = [d for d in dets if (d.get('class') or '').lower() in WR_CLASSES]
             if len(wr_dets) > MAX_WR:
                 off_ys = [d['bbox']['center_y'] for d in dets
-                          if d.get('class', '').lower() not in ('defense', 'ref', 'yard_marker')
+                          if (d.get('class') or '').lower() not in ('', 'defense', 'ref', 'yard_marker')
                           and d['bbox'].get('center_y') is not None]
                 if off_ys:
                     mean_y = sum(off_ys) / len(off_ys)
@@ -1625,9 +1640,27 @@ def _load_position_data_for_offense_mode(parent):
                     for d in wr_dets[MAX_WR:]:
                         d['class'] = 'oline'
 
-        _ensure_qb_labeled(data)
-        _label_running_backs(data)
-        _resolve_qb_rb_by_height(data)
+        # Prefer field-geometry roles (homography yards); fall back to pixel heuristics.
+        homography = {}
+        homography_file = os.path.join(base_cache_dir, folder_name, "homography",
+                                       f"{video_name}_normalized_positions.json")
+        if os.path.exists(homography_file):
+            try:
+                with open(homography_file, 'r') as f:
+                    homography = json.load(f).get('normalized_positions') or {}
+            except Exception as hom_err:
+                print(f"[OFFENSE SELECTION] Warning: could not read homography: {hom_err}")
+
+        for frame_data in data.get('frames', []):
+            field_points = homography.get(str(frame_data.get('frame_number', 0))) or []
+            label_unmatched_by_line(frame_data.get('detections', []), field_points)
+            if assign_roles_by_field_geometry(frame_data.get('detections', []), field_points):
+                print(f"[OFFENSE SELECTION] Assigned roles from field geometry")
+            else:
+                single = {'frames': [frame_data]}
+                _ensure_qb_labeled(single)
+                _label_running_backs(single)
+                _resolve_qb_rb_by_height(single)
         if hasattr(parent, 'custom_video'):
             parent.custom_video.set_detection_data(data)
             parent.custom_video.set_show_boxes(True)

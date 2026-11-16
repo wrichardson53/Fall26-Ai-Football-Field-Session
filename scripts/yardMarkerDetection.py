@@ -26,7 +26,13 @@ YARD_MARKER_CLASSES = {
     14: 'nr1', 15: 'nr2', 16: 'nr3', 17: 'nr4'
 }
 
-def yardMarkerDetection(video_path, model_path="yolo_models/yardMark.pt", confidence_threshold=0.7):
+# Snap mode samples a short window around the snap so the correspondence step can
+# borrow markers from a neighbouring frame when the snap frame itself has too few.
+SNAP_WINDOW_FRAMES = 30
+SNAP_WINDOW_STEP = 5
+
+
+def yardMarkerDetection(video_path, model_path="yolo_models/yardMark.pt", confidence_threshold=0.7, only_frames=None):
     """
     Detect yard markers in video frames using a trained YOLO model
     
@@ -34,6 +40,7 @@ def yardMarkerDetection(video_path, model_path="yolo_models/yardMark.pt", confid
         video_path: Path to input video file
         model_path: Path to YOLO model file
         confidence_threshold: Minimum confidence for detections
+        only_frames: If given, process just these frame numbers (e.g. around the snap)
     
     Returns:
         Dictionary with detection results
@@ -88,10 +95,17 @@ def yardMarkerDetection(video_path, model_path="yolo_models/yardMark.pt", confid
     
     frame_number = 0
     detections_count = 0
+    frame_queue = sorted(f for f in set(only_frames) if 0 <= f < total_frames) if only_frames else None
     
     print("[INFO] Processing frames...")
     
     while True:
+        if frame_queue is not None:
+            if not frame_queue:
+                break
+            # Seek the same way positionDetection.py does so both see the identical frame.
+            frame_number = frame_queue.pop(0)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ret, frame = cap.read()
         if not ret:
             break
@@ -172,14 +186,14 @@ def yardMarkerDetection(video_path, model_path="yolo_models/yardMark.pt", confid
     
     # Add summary statistics
     results["summary"] = {
-        "total_frames_processed": frame_number,
+        "total_frames_processed": len(results["frames"]),
         "total_detections": detections_count,
         "frames_with_detections": len([f for f in results["frames"] if f["detections"]]),
-        "average_detections_per_frame": detections_count / frame_number if frame_number > 0 else 0
+        "average_detections_per_frame": detections_count / len(results["frames"]) if results["frames"] else 0
     }
     
     print(f"[SUCCESS] Yard marker detection completed!")
-    print(f"[INFO] Summary: {detections_count} total detections across {frame_number} frames")
+    print(f"[INFO] Summary: {detections_count} total detections across {len(results['frames'])} frames")
     print(f"[INFO] Frames with detections: {results['summary']['frames_with_detections']}")
     
     return results
@@ -207,15 +221,27 @@ def main():
                        help='Path to YOLO model file')
     parser.add_argument('--confidence', type=float, default=0.5,
                        help='Confidence threshold for detections')
+    parser.add_argument('--snap-detection', type=str, default=None,
+                       help='Snap detection JSON: process only a short window around the snap frame')
     
     args = parser.parse_args()
     
     try:
+        only_frames = None
+        if args.snap_detection:
+            with open(args.snap_detection, 'r') as f:
+                snaps = json.load(f).get('snaps', [])
+            if not snaps:
+                raise ValueError(f"No snap found in {args.snap_detection}")
+            snap_frame = snaps[0].get('frame')
+            only_frames = list(range(snap_frame - SNAP_WINDOW_FRAMES, snap_frame + SNAP_WINDOW_FRAMES + 1, SNAP_WINDOW_STEP))
+
         # Run detection
         results = yardMarkerDetection(
             video_path=args.video,
             model_path=args.model,
-            confidence_threshold=args.confidence
+            confidence_threshold=args.confidence,
+            only_frames=only_frames
         )
         
         # Save results

@@ -225,7 +225,12 @@ def extract_geometric_features(features: torch.Tensor) -> torch.Tensor:
             features = torch.from_numpy(features)
 
         features = features.float()
-        coords = features.reshape(-1, 11, 2)
+        coords = features.reshape(-1, 11, 2).clone()
+
+        # Scale to [0, 1] by field dimensions, matching train_offense_positions.py
+        # (metadata "normalize": "field_scale"). x uses 100, as in training.
+        coords[:, :, 0] = coords[:, :, 0] / 100.0
+        coords[:, :, 1] = coords[:, :, 1] / FIELD_WIDTH_YD
 
         # 1. Center (translation invariance)
         centroid = coords.mean(axis=1, keepdims=True)
@@ -486,6 +491,114 @@ def _determine_backfield_type(video_name, folder_name, base_cache_dir):
 
     print(f"[INFO] Backfield depth: {depth:.2f} yards (offense_side={offense_side})")
     return "GUN" if depth >= .3 else "UNDER CENTER"
+
+
+RECEIVER_ROLES = ("wide_receiver", "tight_end")
+
+
+def _receiver_set_name(strong, weak, total, has_back=False):
+    """Name a receiver distribution, e.g. (3, 1) -> 'TRIPS (3x1)'. EMPTY means
+    five or more receivers and no running back in the backfield."""
+    ratio = f"{strong}x{weak}"
+    if strong >= 4:
+        name = "QUADS"
+    elif strong == 3:
+        name = "TRIPS"
+    elif strong == 2 and weak == 2:
+        name = "DOUBLES"
+    elif strong == 2:
+        name = "TWINS"
+    else:
+        name = "PRO"
+    if total >= 5 and not has_back:
+        name = f"EMPTY {name}"
+    return f"{name} ({ratio})"
+
+
+def _roster_from_player_detections(position_detections, normalized):
+    """
+    One entry per player-model detection (the homography points), which finds
+    nearly every player at the snap, unlike the position model. Each borrows the
+    class of the nearest position-model box; players the position model missed
+    are put on offense or defense by which side of the line of scrimmage they are.
+    """
+    from positionRoles import label_unmatched_by_line, MATCH_PX
+
+    def nearest_label(bbox):
+        best, best_d = None, MATCH_PX ** 2
+        for p in position_detections:
+            pb = p.get("bbox") or {}
+            if pb.get("center_x") is None:
+                continue
+            d = (pb["center_x"] - bbox["center_x"]) ** 2 + (pb["center_y"] - bbox["center_y"]) ** 2
+            if d < best_d:
+                best, best_d = (p.get("class") or "").lower(), d
+        return best
+
+    roster = []
+    for hp in normalized:
+        bbox = hp.get("original_bbox") or {}
+        npos = hp.get("normalized_position") or {}
+        if bbox.get("center_x") is None or npos.get("x") is None:
+            continue
+        roster.append({"class": nearest_label(bbox), "bbox": dict(bbox)})
+
+    label_unmatched_by_line(roster, normalized)
+    return roster
+
+
+def _determine_receiver_set(video_name, folder_name, base_cache_dir, receiver_roles=RECEIVER_ROLES):
+    """
+    Rule-based receiver set from field positions at the snap: assign roles with
+    app/positionRoles.py (field geometry), then count wide receivers + tight ends
+    (or just `receiver_roles`) on each side of the center. Returns e.g.
+    'TRIPS (3x1)', or None.
+    """
+    import statistics
+    app_dir = os.path.join(_get_project_root(), "app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+    try:
+        from positionRoles import assign_roles_by_field_geometry, _match_field_points
+    except ImportError as e:
+        print(f"[INFO] Receiver set skipped: could not import positionRoles ({e})")
+        return None
+
+    snap_frame = get_snap_frame(os.path.join(base_cache_dir, folder_name, "snap_detection",
+                                             f"{video_name}_snap_detection.json"))
+    if snap_frame is None:
+        return None
+    position_detections, _w = get_positions_at_snap(
+        os.path.join(base_cache_dir, folder_name, "positions", f"{video_name}_position.json"), snap_frame)
+    normalized = get_normalized_positions_at_snap(
+        os.path.join(base_cache_dir, folder_name, "homography",
+                     f"{video_name}_normalized_positions.json"), snap_frame)
+    if not position_detections or not normalized:
+        return None
+
+    dets = _roster_from_player_detections(position_detections, normalized)
+    if not assign_roles_by_field_geometry(dets, normalized):
+        print("[INFO] Receiver set skipped: not enough players to assign roles")
+        return None
+
+    pos = _match_field_points(dets, normalized)
+
+    def role(d):
+        return (d.get("class") or "").lower()
+
+    oline_y = [pos[id(d)][1] for d in dets if role(d) == "oline" and id(d) in pos]
+    if len(oline_y) < 3:
+        return None
+    center_y = statistics.median(oline_y)
+
+    receivers_y = [pos[id(d)][1] for d in dets if role(d) in receiver_roles and id(d) in pos]
+    side_a = sum(1 for y in receivers_y if y > center_y)
+    side_b = len(receivers_y) - side_a
+    strong, weak = max(side_a, side_b), min(side_a, side_b)
+    has_back = any(role(d) == "running_back" for d in dets)
+    result = _receiver_set_name(strong, weak, len(receivers_y), has_back)
+    print(f"[INFO] Receiver set: {result} from {len(receivers_y)} receivers/TEs")
+    return result
 
 
 def load_data(file_path):
@@ -776,6 +889,14 @@ def process_frame_data(frame_data, video_name, folder_name=None, cache_dir="cach
         if backfield is not None:
             df.at[video_row_index, 'BACKFIELD'] = backfield
             print(f"[INFO] Backfield type: {backfield}")
+
+        # Rule-based receiver set (TRIPS / DOUBLES / ...) from field-geometry roles
+        receiver_set = _determine_receiver_set(video_name, folder_name, base_cache_dir)
+        if receiver_set is not None:
+            if "WR SET" not in df.columns:
+                df["WR SET"] = ""
+            df["WR SET"] = df["WR SET"].astype(object)
+            df.at[video_row_index, "WR SET"] = receiver_set
 
         # Save the updated CSV
         df.to_csv(csv_file_path, index=False)

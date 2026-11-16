@@ -64,3 +64,5 @@ build/
 dist/
 
 cache/
+# Evaluation run logs
+evaluation/logs/
